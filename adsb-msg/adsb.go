@@ -1,0 +1,834 @@
+package main
+
+import (
+	"net"
+	"strconv"
+	"fmt"
+	"bufio"
+	"strings"
+	"math"
+	"os"
+	"encoding/hex"
+	"github.com/vaughan0/go-ini"
+)
+
+func get_ICAO(s string) []byte {
+	icao,err := hex.DecodeString(s);
+	if err != nil {
+		fmt.Println(err)
+	}
+	return icao
+}
+
+func time_of_day(time string) uint32 {
+	t := strings.Split(time, ":")	
+	hour, err := strconv.ParseInt(t[0], 10, 64)
+	min, err := strconv.ParseInt(t[1], 10, 64)
+	sec, err := strconv.ParseFloat(t[2], 64)
+	if err != nil {
+		fmt.Print("error")
+	}
+	tod := (((hour * 60) + min) * 60) * 128 + (int64)(sec * 128)
+	return (uint32)(tod)
+}
+
+func target_identification(target string) uint64 {
+	ti := []byte(target)
+	len := len(target)
+	var res uint64 = 0
+	for i := 0; i < len; i++ {
+		res = res << 6
+		if ((ti[i] >= 'A') && (ti[i] <= 'Z')) {
+			res = res | (uint64)(ti[i] - 'A' + 1)
+		} else {
+			res = res | (uint64)(ti[i] - '0') | 0x30
+		}
+	}
+	for i := len; i < 8; i++ {
+		res = res << 6
+		res = res | 0x20
+	}
+	return res
+}
+
+func flight_level(s string) int16 {
+	fl, err := strconv.ParseInt(s, 10, 32)
+	if err != nil {
+		fmt.Print("error")
+	}
+	fl = fl * 4 / 100
+	return (int16)(fl)
+}
+
+func get_lon_lat(s string) int32 {
+	pos, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		fmt.Print("error")
+	}
+	pos = pos * math.Pow(2, 30) / 180
+	return (int32)(pos)
+}
+
+func ground_speed(s string) int32 {
+	res, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		fmt.Print("error")
+	}
+	res = res * (int64)(math.Pow(2,14)) / 3600
+	return (int32)(res)
+}
+
+func track_angle(s string) int32 {
+	res, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		fmt.Print("error")
+	}
+	res = res * (int64)(math.Pow(2,16)) / 360
+	return (int32)(res)
+}
+
+func get_squawk(s string) int32 {
+	res, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		fmt.Print("error")
+	}
+	squawk := res / 1000
+	res = res % 1000
+	squawk = squawk * 8 + res / 100
+	res = res % 100
+	squawk = squawk * 8 + res / 10
+	res = res % 10
+	squawk = squawk * 8 + res
+	return (int32)(squawk)
+}
+
+
+var udp [10]net.Conn
+
+const c21def = 0
+const c21len0 = 1
+const c21len = 2
+const c21fsd1 = 3
+const c21fsd2 = 4
+const c21fsd3 = 5
+const c21fsd4 = 6
+const c21fsd5 = 7
+
+func main() {
+	config_file := "adsb.conf"
+	if len(os.Args) > 1 {
+		config_file = os.Args[1]
+	}
+	file,err := ini.LoadFile(config_file)
+	if err != nil { fmt.Printf("Error: %s", err) }
+	adsb_server, ok := file.Get("default", "adsb_server")
+	if !ok {panic("adsb_server configuration missing")}
+	udp_server, ok := file.Get("default", "udp_server")
+	if !ok {panic("udp_server configuration missing")}
+	sac, ok := file.Get("default", "SAC")
+	if !ok {panic("SAC configuration missing")}
+	sic, ok := file.Get("default", "SIC")
+	if !ok {panic("SIC configuration missing")}
+
+	SAC, err := strconv.ParseInt(sac, 10, 32)
+	if err != nil {
+		fmt.Print("error")
+	}
+
+	SIC, err := strconv.ParseInt(sic, 10, 32)
+	if err != nil {
+		fmt.Print("error")
+	}
+
+	udpserver := strings.Split(udp_server, ",")
+	for i := range udpserver {
+		udp[i], err = net.Dial("udp", udpserver[i])
+		if err != nil {
+			fmt.Printf("Some error %v", err)
+			return
+		}
+		fmt.Println("Connected to UDP server " + udpserver[i])
+	}
+
+	// connect to this socket
+	conn, _ := net.Dial("tcp", adsb_server + ":30003")
+	for {
+		// listen for reply
+		BCat21 := make([]byte, 100)
+		message, _ := bufio.NewReader(conn).ReadString('\n')
+		a := strings.Split(message, ",")
+		if a[0] == "MSG" {
+			fmt.Print("Message: " + message)
+			msg_type := a[1]
+			switch msg_type {
+				case "1":
+					fmt.Println("MSG 1")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					target_id := target_identification(a[10])
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Target Identification: %X\n", target_id)
+
+					BCat21[c21def] = 21 // cat21 = 21
+					BCat21[c21len0] = 0 // 
+					BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+					BCat21[c21fsd1] = 1
+					BCat21[c21fsd2] = 1
+					BCat21[c21fsd3] = 1
+					BCat21[c21fsd4] = 1
+					BCat21[c21fsd5] = 0
+					PPloadC21 := 8 //pointer payload cat21
+
+					// fsd1
+					BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = 0x00   // Actual Target Report
+					PPloadC21 += 1          // add pointer
+
+					//fsd2
+					BCat21[c21fsd2] |= 0x10 // Target Address
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = ICAO[0]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[1]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[2]   // ICAO
+					PPloadC21 += 1          // add pointer
+
+					//fsd3
+					BCat21[c21fsd3] |= 0x20 // Quality Indicator
+					BCat21[c21len] += 1     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = 0   // Quality
+					PPloadC21 += 1          // add pointer
+
+					//fsd5
+					BCat21[c21fsd5] |= 0x80 // Target Identification
+					BCat21[c21len] += 6     // add 6 byte to total length cat21
+					BCat21[PPloadC21] = (byte)((target_id >> 40) & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((target_id >> 32) & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((target_id >> 24) & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((target_id >> 16) & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((target_id >> 8) & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(target_id & 0xFF)  // Target Identification
+					PPloadC21 += 1          // add pointer
+
+					BCat21var := make([]byte, BCat21[c21len])
+					copy(BCat21var,BCat21)
+
+					fmt.Print("CAT21:\n");
+					for i := 0; i < len(BCat21var); i++ {
+						fmt.Printf("%02x ", BCat21var[i])
+					}
+					fmt.Println()
+					fmt.Println()
+					for i := range udpserver {
+						udp[i].Write(BCat21var)
+					}
+
+				case "2":
+					fmt.Println("MSG 2")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					FL := flight_level(a[11])
+					lat := get_lon_lat(a[14])
+					lon := get_lon_lat(a[15])
+					//alert := a[18]
+					//emer := a[19]
+					//SPI := a[20]
+					//Gnd := a[21]
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Flightlevel: %v\n", FL/4)
+					fmt.Printf("Latitude: %v\n", (float64) (lat) * 180 / math.Pow(2, 30))
+					fmt.Printf("Longitude: %v\n", (float64) (lon) * 180 / math.Pow(2, 30))
+
+					if ((lon != 0) && (lat != 0)) {
+						BCat21[c21def] = 21 // cat21 = 21
+						BCat21[c21len0] = 0 // 
+						BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+						BCat21[c21fsd1] = 1
+						BCat21[c21fsd2] = 1
+						BCat21[c21fsd3] = 1
+						BCat21[c21fsd4] = 1
+						BCat21[c21fsd5] = 0
+						PPloadC21 := 8 //pointer payload cat21
+
+						// fsd1
+						BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+						BCat21[c21len] += 2     // add 2 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+						BCat21[c21len] += 2     // add 2 bytes to total length cat21
+						BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = 0x00   // Actual Target Report
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x08 // Time applicability for position
+						BCat21[c21len] += 3     // add 3 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x02 // Position in WGS-84 coordinates high res
+						BCat21[c21len] += 8     // add 8 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)((lat >> 24) & 0xFF)   // Latitude
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lat >> 16) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lat >> 8) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(lat & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 24) & 0xFF)   // Longitude
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 16) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 8) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(lon & 0xFF)
+						PPloadC21 += 1          // add pointer
+
+						//fsd2
+						BCat21[c21fsd2] |= 0x10 // Target Address
+						BCat21[c21len] += 3     // add 3 bytes to total length cat21
+						BCat21[PPloadC21] = ICAO[0]   // ICAO
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = ICAO[1]   // ICAO
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = ICAO[2]   // ICAO
+						PPloadC21 += 1          // add pointer
+
+						//fsd3
+						BCat21[c21fsd3] |= 0x20 // Quality Indicator
+						BCat21[c21len] += 1     // add 1 byte to total length cat21
+						BCat21[PPloadC21] = 0   // Quality
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd3] |= 0x02 // Flight Level
+						BCat21[c21len] += 2     // add 1 byte to total length cat21
+						BCat21[PPloadC21] = (byte)((FL >> 8) & 0xFF)   // Flight Level
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(FL & 0xFF)   // Flight Level
+						PPloadC21 += 1          // add pointer
+
+						BCat21var := make([]byte, BCat21[c21len])
+						copy(BCat21var,BCat21)
+
+						fmt.Print("CAT21:\n");
+						for i := 0; i < len(BCat21var); i++ {
+							fmt.Printf("%02x ", BCat21var[i])
+						}
+						fmt.Println()
+						fmt.Println()
+						for i := range udpserver {
+							udp[i].Write(BCat21var)
+						}
+					}
+
+				case "3":
+					fmt.Println("MSG 3")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					FL := flight_level(a[11])
+					lat := get_lon_lat(a[14])
+					lon := get_lon_lat(a[15])
+					//alert := a[18]
+					//emer := a[19]
+					//SPI := a[20]
+					//Gnd := a[21]
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Flightlevel: %v\n", FL/4)
+					fmt.Printf("Latitude: %v\n", (float64) (lat) * 180 / math.Pow(2, 30))
+					fmt.Printf("Longitude: %v\n", (float64) (lon) * 180 / math.Pow(2, 30))
+
+					if ((lon != 0) && (lat != 0)) {
+						BCat21[c21def] = 21 // cat21 = 21
+						BCat21[c21len0] = 0 // 
+						BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+						BCat21[c21fsd1] = 1
+						BCat21[c21fsd2] = 1
+						BCat21[c21fsd3] = 1
+						BCat21[c21fsd4] = 1
+						BCat21[c21fsd5] = 0
+						PPloadC21 := 8 //pointer payload cat21
+
+						// fsd1
+						BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+						BCat21[c21len] += 2     // add 2 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+						BCat21[c21len] += 2     // add 2 bytes to total length cat21
+						BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = 0x00   // Actual Target Report
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x08 // Time applicability for position
+						BCat21[c21len] += 3     // add 3 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd1] |= 0x02 // Position in WGS-84 coordinates high res
+						BCat21[c21len] += 8     // add 8 bytes to total length cat21
+						BCat21[PPloadC21] = (byte)((lat >> 24) & 0xFF)   // Latitude
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lat >> 16) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lat >> 8) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(lat & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 24) & 0xFF)   // Longitude
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 16) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)((lon >> 8) & 0xFF)
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(lon & 0xFF)
+						PPloadC21 += 1          // add pointer
+
+						//fsd2
+						BCat21[c21fsd2] |= 0x10 // Target Address
+						BCat21[c21len] += 3     // add 3 bytes to total length cat21
+						BCat21[PPloadC21] = ICAO[0]   // ICAO
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = ICAO[1]   // ICAO
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = ICAO[2]   // ICAO
+						PPloadC21 += 1          // add pointer
+
+						//fsd3
+						BCat21[c21fsd3] |= 0x20 // Quality Indicator
+						BCat21[c21len] += 1     // add 1 byte to total length cat21
+						BCat21[PPloadC21] = 0   // Quality
+						PPloadC21 += 1          // add pointer
+
+						BCat21[c21fsd3] |= 0x02 // Flight Level
+						BCat21[c21len] += 2     // add 1 byte to total length cat21
+						BCat21[PPloadC21] = (byte)((FL >> 8) & 0xFF)   // Flight Level
+						PPloadC21 += 1          // add pointer
+						BCat21[PPloadC21] = (byte)(FL & 0xFF)   // Flight Level
+						PPloadC21 += 1          // add pointer
+
+						BCat21var := make([]byte, BCat21[c21len])
+						copy(BCat21var,BCat21)
+
+						fmt.Print("CAT21:\n");
+						for i := 0; i < len(BCat21var); i++ {
+							fmt.Printf("%02x ", BCat21var[i])
+						}
+						fmt.Println()
+						fmt.Println()
+						for i := range udpserver {
+							udp[i].Write(BCat21var)
+						}
+					}
+
+				case "4":
+					fmt.Println("MSG 4")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					groundspeed := ground_speed(a[12])
+					heading := track_angle(a[13])
+					//vr := a[16]
+
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Ground Speed: %v NM/s\n", (float64) (groundspeed) / math.Pow(2, 14))
+					fmt.Printf("Track Angle: %v degree\n", (float64) (heading) * 360 / math.Pow(2, 16))
+					//fmt.Println("Vertical Rate: " + vr)
+
+					BCat21[c21def] = 21 // cat21 = 21
+					BCat21[c21len0] = 0 // 
+					BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+					BCat21[c21fsd1] = 1
+					BCat21[c21fsd2] = 1
+					BCat21[c21fsd3] = 1
+					BCat21[c21fsd4] = 1
+					BCat21[c21fsd5] = 0
+					PPloadC21 := 8 //pointer payload cat21
+
+					// fsd1
+					BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = 0x00   // Actual Target Report
+					PPloadC21 += 1          // add pointer
+
+					// fsd2
+					BCat21[c21fsd2] |= 0x10 // Target Address
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = ICAO[0]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[1]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[2]   // ICAO
+					PPloadC21 += 1          // add pointer
+
+					//fsd3
+					BCat21[c21fsd3] |= 0x20 // Quality Indicator
+					BCat21[c21len] += 1     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = 0   // Quality
+					PPloadC21 += 1          // add pointer
+
+					// fsd4
+					BCat21[c21fsd4] |= 0x08 // Airborne Ground Vector
+					BCat21[c21len] += 4     // add 4 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)((groundspeed >> 8) & 0xFF) // ground speed
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(groundspeed & 0xFF)
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((heading >> 8) & 0xFF) // track angle
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(heading & 0xFF)
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd4] |= 0x02 // Time of report transmission
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+
+					BCat21var := make([]byte, BCat21[c21len])
+					copy(BCat21var,BCat21)
+
+					fmt.Print("CAT21:\n");
+					for i := 0; i < len(BCat21var); i++ {
+						fmt.Printf("%02x ", BCat21var[i])
+					}
+					fmt.Println()
+					fmt.Println()
+					for i := range udpserver {
+						udp[i].Write(BCat21var)
+					}
+
+				case "5":
+					fmt.Println("MSG 5")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					FL := flight_level(a[11])
+
+					//alert := a[18]
+					//SPI := a[20]
+					//Gnd := a[21]
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Flightlevel: %v\n", FL/4)
+
+					BCat21[c21def] = 21 // cat21 = 21
+					BCat21[c21len0] = 0 // 
+					BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+					BCat21[c21fsd1] = 1
+					BCat21[c21fsd2] = 1
+					BCat21[c21fsd3] = 1
+					BCat21[c21fsd4] = 1
+					BCat21[c21fsd5] = 0
+					PPloadC21 := 8 //pointer payload cat21
+
+					// fsd1
+					BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = 0x00   // Actual Target Report
+					PPloadC21 += 1          // add pointer
+
+					// fsd2
+					BCat21[c21fsd2] |= 0x10 // Target Address
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = ICAO[0]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[1]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[2]   // ICAO
+					PPloadC21 += 1          // add pointer
+
+					//fsd3
+					BCat21[c21fsd3] |= 0x20 // Quality Indicator
+					BCat21[c21len] += 1     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = 0   // Quality
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd3] |= 0x02 // Flight Level
+					BCat21[c21len] += 2     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = (byte)((FL >> 8) & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(FL & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+
+					//fsd4
+					BCat21[c21fsd4] |= 0x02 // Time of report transmission
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+
+					BCat21var := make([]byte, BCat21[c21len])
+					copy(BCat21var,BCat21)
+
+					fmt.Print("CAT21:\n");
+					for i := 0; i < len(BCat21var); i++ {
+						fmt.Printf("%02x ", BCat21var[i])
+					}
+					fmt.Println()
+					fmt.Println()
+					for i := range udpserver {
+						udp[i].Write(BCat21var)
+					}
+
+				case "6":
+					fmt.Println("MSG 6")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					FL := flight_level(a[11])
+
+					squawk := get_squawk(a[17])
+					//alert := a[18]
+					//emer := a[19]
+					//SPI := a[20]
+					//Gnd := a[21]
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Flightlevel: %v\n", FL/4)
+					fmt.Printf("Squawk: %v\n", squawk)
+
+					BCat21[c21def] = 21 // cat21 = 21
+					BCat21[c21len0] = 0 // 
+					BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+					BCat21[c21fsd1] = 1
+					BCat21[c21fsd2] = 1
+					BCat21[c21fsd3] = 1
+					BCat21[c21fsd4] = 1
+					BCat21[c21fsd5] = 0
+					PPloadC21 := 8 //pointer payload cat21
+
+					// fsd1
+					BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = 0x00   // Actual Target Report
+					PPloadC21 += 1          // add pointer
+
+					// fsd2
+					BCat21[c21fsd2] |= 0x10 // Target Address
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = ICAO[0]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[1]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[2]   // ICAO
+					PPloadC21 += 1          // add pointer
+
+					//fsd3
+					BCat21[c21fsd3] |= 0x20 // Quality Indicator
+					BCat21[c21len] += 1     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = 0   // Quality
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd3] |= 0x08 // Mode 3/A Code
+					BCat21[c21len] += 2     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = (byte)((squawk >> 8) & 0xFF)   // Mode 3/A (Squawk Number)
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(squawk & 0xFF)
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd3] |= 0x02 // Flight Level
+					BCat21[c21len] += 2     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = (byte)((FL >> 8) & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(FL & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+
+					//fsd4
+					BCat21[c21fsd4] |= 0x02 // Time of report transmission
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+
+					BCat21var := make([]byte, BCat21[c21len])
+					copy(BCat21var,BCat21)
+
+					fmt.Print("CAT21:\n");
+					for i := 0; i < len(BCat21var); i++ {
+						fmt.Printf("%02x ", BCat21var[i])
+					}
+					fmt.Println()
+					fmt.Println()
+					for i := range udpserver {
+						udp[i].Write(BCat21var)
+					}
+
+				case "7":
+					fmt.Println("MSG 7")
+					ICAO := get_ICAO(a[4])
+					//date := a[6]
+					TOD := time_of_day(a[7])
+					FL := flight_level(a[11])
+
+					//Gnd := a[21]
+					fmt.Printf("Decode ICAO[2]: %X\n", ICAO[0])
+					fmt.Printf("Decode ICAO[1]: %X\n", ICAO[1])
+					fmt.Printf("Decode ICAO[0]: %X\n", ICAO[2])
+					fmt.Printf("Time of Day: %v\n", TOD)
+					fmt.Printf("Flightlevel: %v\n", FL/4)
+
+					BCat21[c21def] = 21 // cat21 = 21
+					BCat21[c21len0] = 0 // 
+					BCat21[c21len] = 8  // panjang payload awal = 8 = 1header + 2length + 4FSPEC/UAP
+					BCat21[c21fsd1] = 1
+					BCat21[c21fsd2] = 1
+					BCat21[c21fsd3] = 1
+					BCat21[c21fsd4] = 1
+					BCat21[c21fsd5] = 0
+					PPloadC21 := 8 //pointer payload cat21
+
+					// fsd1
+					BCat21[c21fsd1] |= 0x80 // Data Source Identifier SAC/SIC
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)(SAC)   // System Area Code
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(SIC)   // System Identification Code
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd1] |= 0x40 // Target Report Descriptor
+					BCat21[c21len] += 2     // add 2 bytes to total length cat21
+					BCat21[PPloadC21] = 0x01   // 24 bit ICAO Address
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = 0x00   // Actual Target Report
+					PPloadC21 += 1          // add pointer
+
+					// fsd2
+					BCat21[c21fsd2] |= 0x10 // Target Address
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = ICAO[0]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[1]   // ICAO
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = ICAO[2]   // ICAO
+					PPloadC21 += 1          // add pointer
+
+					//fsd3
+					BCat21[c21fsd3] |= 0x20 // Quality Indicator
+					BCat21[c21len] += 1     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = 0   // Quality
+					PPloadC21 += 1          // add pointer
+
+					BCat21[c21fsd3] |= 0x02 // Flight Level
+					BCat21[c21len] += 2     // add 1 byte to total length cat21
+					BCat21[PPloadC21] = (byte)((FL >> 8) & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(FL & 0xFF)   // Flight Level
+					PPloadC21 += 1          // add pointer
+
+					//fsd4
+					BCat21[c21fsd4] |= 0x02 // Time of report transmission
+					BCat21[c21len] += 3     // add 3 bytes to total length cat21
+					BCat21[PPloadC21] = (byte)((TOD >> 16) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)((TOD >> 8) & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+					BCat21[PPloadC21] = (byte)(TOD & 0xFF)   // TOD
+					PPloadC21 += 1          // add pointer
+
+					BCat21var := make([]byte, BCat21[c21len])
+					copy(BCat21var,BCat21)
+
+					fmt.Print("CAT21:\n");
+					for i := 0; i < len(BCat21var); i++ {
+						fmt.Printf("%02x ", BCat21var[i])
+					}
+					fmt.Println()
+					fmt.Println()
+					for i := range udpserver {
+						udp[i].Write(BCat21var)
+					}
+				case "8":
+					fmt.Println("MSG 8")
+			}
+			fmt.Println()
+		}
+	}
+}
